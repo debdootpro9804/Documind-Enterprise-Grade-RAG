@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv
+.env
+*.egg-info/
+
+# Node
+node_modules/
+dist/
+.env.local
+
+# IDE
+.vscode/settings.json
+.idea/
+
+# Uploads (temp files)
+backend/uploads/
+
+# Pinecone / model caches
+.cache/
