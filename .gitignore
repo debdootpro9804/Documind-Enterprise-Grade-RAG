@@ -5,6 +5,8 @@ venv/
 .venv
 .env
 *.egg-info/
+.env.local
+.env.prod
 
 # Node
 node_modules/
