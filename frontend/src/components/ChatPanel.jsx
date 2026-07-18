@@ -1,6 +1,5 @@
 import { useState, useRef, useEffect } from "react"
-import ReactMarkdown from "react-markdown"
-import remarkGfm     from "remark-gfm"
+import MarkdownRenderer from "./MarkdownRenderer"
 import useAuthStore  from "../store/authStore"
 
 const SUGGESTIONS = [
@@ -246,9 +245,7 @@ function Message({ message }) {
         ) : (
           <div className="px-4 py-3 rounded-2xl rounded-tl-sm text-sm leading-relaxed bg-white prose max-w-none"
                style={{ border: "1px solid #e8e7e3", color: "#1a1a19" }}>
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>
-              {message.content}
-            </ReactMarkdown>
+            <MarkdownRenderer content={message.content} />
             {message.streaming && (
               <span className="inline-block w-0.5 h-4 ml-0.5 align-middle animate-pulse"
                     style={{ background: "#534AB7" }}/>
