@@ -204,7 +204,6 @@ export default function Sidebar({ selectedDocIds, onSelectDoc, onNewChat }) {
                 <span className="text-xs" style={{ color: "rgba(255,255,255,0.2)" }}>
                   PDF · DOCX · TXT · JPG · PNG · max 20 MB
                 </span>
-                </span>
               </>
             )}
           </label>
