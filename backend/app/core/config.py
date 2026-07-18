@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     azure_openai_api_version: str = "2024-12-01-preview"
     azure_embedding_deployment: str = "text-embedding-3-large"
     azure_embedding_dimensions: int = 3072
-
+    
     # Groq fallback
     groq_api_key: str
     groq_model: str = "llama-3.3-70b-versatile"

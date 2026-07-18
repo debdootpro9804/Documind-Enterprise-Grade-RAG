@@ -8,7 +8,7 @@ from app.services.cache_service import cache_service
 router = APIRouter()
 
 MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024   # 20 MB
-ALLOWED_EXTENSIONS  = {".pdf", ".docx", ".txt"}
+ALLOWED_EXTENSIONS  = {".pdf", ".docx", ".txt",".jpg", ".jpeg", ".png", ".webp"}  # Supported document and image types
 
 
 @router.post("/upload")
@@ -29,7 +29,7 @@ async def upload_document(
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             400,
-            f"File type '{ext}' not supported. Please upload PDF, DOCX, or TXT."
+            f"File type '{ext}' not supported. Please upload PDF, DOCX, TXT, or an image file."
         )
 
     # Read and validate size

@@ -3,8 +3,6 @@ import tempfile
 import os
 from pathlib import Path
 from loguru import logger
-from pypdf import PdfReader
-from docx import Document as DocxDocument
 from pinecone import Pinecone
 from app.core.config import settings
 from app.services.llm_service import llm_service
@@ -12,12 +10,19 @@ from app.services.llm_service import llm_service
 
 class IngestionService:
 
-    # How many characters per chunk (roughly 500 words ≈ 2000 chars)
-    CHUNK_SIZE     = 700
-    # How many characters to repeat between chunks so nothing is lost at boundaries
-    CHUNK_OVERLAP  = 100
-    # File types we accept
-    SUPPORTED_TYPES = {".pdf", ".docx", ".txt"}
+    CHUNK_SIZE    = 2000
+    CHUNK_OVERLAP = 200
+
+    SUPPORTED_TYPES = {
+        ".pdf", ".docx", ".txt",
+        ".jpg", ".jpeg", ".png", ".webp",
+    }
+
+    IMAGE_TYPES = {".jpg", ".jpeg", ".png", ".webp"}
+
+    # Only extract images above this size — smaller ones are usually
+    # decorative icons or bullets, not meaningful content
+    MIN_IMAGE_BYTES = 10_000   # 10 KB
 
     def __init__(self):
         pc = Pinecone(api_key=settings.pinecone_api_key)
@@ -25,7 +30,7 @@ class IngestionService:
         logger.info("IngestionService ready — Pinecone index connected")
 
     # ------------------------------------------------------------------ #
-    # Main entry point — call this from the upload route                  #
+    # Main entry point                                                     #
     # ------------------------------------------------------------------ #
 
     async def ingest_document(
@@ -35,201 +40,264 @@ class IngestionService:
         user_id: str,
         document_id: str,
     ) -> dict:
-        """
-        Full pipeline:
-          file bytes → parse text → chunk → embed → upsert to Pinecone
-        Returns a summary dict that the route can send back to the client.
-        """
         ext = Path(filename).suffix.lower()
 
         if ext not in self.SUPPORTED_TYPES:
-            raise ValueError(f"Unsupported file type '{ext}'. Accepted: PDF, DOCX, TXT")
+            raise ValueError(
+                f"Unsupported file type '{ext}'. "
+                f"Accepted: PDF, DOCX, TXT, JPG, PNG, WEBP"
+            )
 
-        logger.info(f"Starting ingestion | file={filename} | user={user_id}")
+        logger.info(f"Ingestion start | file={filename} | user={user_id}")
 
-        # Step 1 — parse raw text out of the file
-        text = await self._parse(file_bytes, ext)
+        # Route to image pipeline or document pipeline
+        if ext in self.IMAGE_TYPES:
+            chunks = await self._process_standalone_image(
+                file_bytes, filename, ext
+            )
+        else:
+            chunks = await self._process_document(file_bytes, filename, ext)
 
-        if not text.strip():
-            raise ValueError("The document appears to be empty or could not be read.")
+        if not chunks:
+            raise ValueError("No content could be extracted from this file.")
 
-        logger.info(f"Parsed {len(text)} characters from '{filename}'")
+        logger.info(f"Total chunks to embed: {len(chunks)}")
 
-        # Step 2 — split into overlapping chunks
-        chunks = self._chunk_text(text)
-        logger.info(f"Created {len(chunks)} chunks")
-
-        # Step 3 — embed each chunk and build Pinecone vector records
         vectors = await self._embed_chunks(chunks, document_id, filename, user_id)
 
-        # Step 4 — upsert all vectors into this user's private namespace
         namespace = f"user-{user_id}"
         self.index.upsert(vectors=vectors, namespace=namespace)
-        logger.info(f"Upserted {len(vectors)} vectors into namespace '{namespace}'")
+        logger.info(f"Upserted {len(vectors)} vectors → namespace '{namespace}'")
 
         return {
             "document_id": document_id,
-            "filename": filename,
-            "chunks": len(chunks),
+            "filename":    filename,
+            "chunks":      len(chunks),
         }
 
     async def delete_document(self, document_id: str, user_id: str) -> None:
-        """
-        Remove all Pinecone vectors that belong to this document.
-        Called when a user deletes a document from their library.
-        """
         namespace = f"user-{user_id}"
         self.index.delete(
             filter={"document_id": {"$eq": document_id}},
             namespace=namespace,
         )
-        logger.info(f"Deleted vectors for document {document_id} from namespace {namespace}")
+        logger.info(f"Deleted vectors for document {document_id}")
 
     # ------------------------------------------------------------------ #
-    # Step 1 — Parsing                                                    #
+    # Document processing (PDF, DOCX, TXT)                                #
     # ------------------------------------------------------------------ #
 
-    async def _parse(self, file_bytes: bytes, ext: str) -> str:
+    async def _process_document(
+        self, file_bytes: bytes, filename: str, ext: str
+    ) -> list[dict]:
+        """
+        Returns a list of chunk dicts, each with 'text' and 'chunk_type'.
+        Text chunks come from the document body.
+        Image chunks come from embedded images described by vision model.
+        """
+        all_chunks = []
+
         if ext == ".pdf":
-            return self._parse_pdf(file_bytes)
+            text, image_descriptions = await self._parse_pdf_with_images(file_bytes)
         elif ext == ".docx":
-            return self._parse_docx(file_bytes)
+            text = self._parse_docx(file_bytes)
+            image_descriptions = []
         elif ext == ".txt":
-            # TXT files are already plain text — just decode the bytes
-            return file_bytes.decode("utf-8", errors="ignore")
+            text = file_bytes.decode("utf-8", errors="ignore")
+            image_descriptions = []
 
-    def _parse_pdf(self, file_bytes: bytes) -> str:
+        # Text chunks
+        if text.strip():
+            text_chunks = self._chunk_text(text)
+            for chunk in text_chunks:
+                all_chunks.append({
+                    "text":       chunk,
+                    "chunk_type": "text",
+                })
+
+        # Image description chunks
+        for i, desc in enumerate(image_descriptions):
+            if desc and len(desc) > 20:
+                all_chunks.append({
+                    "text":       f"[Image {i+1} from document]: {desc}",
+                    "chunk_type": "image_description",
+                })
+
+        logger.info(
+            f"Document processed | "
+            f"text_chunks={len(all_chunks) - len(image_descriptions)} | "
+            f"image_chunks={len(image_descriptions)}"
+        )
+        return all_chunks
+
+    async def _process_standalone_image(
+        self, file_bytes: bytes, filename: str, ext: str
+    ) -> list[dict]:
+        """Process a standalone image file uploaded directly by the user."""
+        logger.info(f"Processing standalone image: {filename}")
+
+        # Map extension to MIME subtype
+        ext_to_mime = {
+            ".jpg":  "jpeg",
+            ".jpeg": "jpeg",
+            ".png":  "png",
+            ".webp": "webp",
+        }
+        mime = ext_to_mime.get(ext, "jpeg")
+
+        description = await llm_service.describe_image(file_bytes, mime)
+
+        return [{
+            "text":       f"[Image: {filename}]: {description}",
+            "chunk_type": "image_description",
+        }]
+
+    # ------------------------------------------------------------------ #
+    # PDF parsing with image extraction                                    #
+    # ------------------------------------------------------------------ #
+
+    async def _parse_pdf_with_images(
+        self, file_bytes: bytes
+    ) -> tuple[str, list[str]]:
         """
-        Write bytes to a temp file, read with pypdf, then delete the temp file.
-        We use a temp file because pypdf needs a file path, not raw bytes.
+        Parse a PDF using pymupdf.
+        Returns (full_text, list_of_image_descriptions).
         """
+        import fitz  # pymupdf
+
+        text_pages = []
+        image_descriptions = []
+
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp.write(file_bytes)
             tmp_path = tmp.name
 
         try:
-            reader = PdfReader(tmp_path)
-            pages = []
-            for page in reader.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    pages.append(page_text)
-            # Join pages with double newline so paragraph boundaries are preserved
-            return "\n\n".join(pages)
+            doc = fitz.open(tmp_path)
+
+            for page_num, page in enumerate(doc):
+                # Extract text from this page
+                page_text = page.get_text()
+                if page_text.strip():
+                    text_pages.append(page_text)
+
+                # Extract images from this page
+                image_list = page.get_images(full=True)
+
+                for img_index, img_info in enumerate(image_list):
+                    xref = img_info[0]
+                    try:
+                        base_image  = doc.extract_image(xref)
+                        image_bytes = base_image["image"]
+                        image_ext   = base_image["ext"]  # 'jpeg', 'png', etc.
+
+                        # Skip tiny images — likely decorative
+                        if len(image_bytes) < self.MIN_IMAGE_BYTES:
+                            logger.debug(
+                                f"Skipping small image on page {page_num+1} "
+                                f"({len(image_bytes)} bytes)"
+                            )
+                            continue
+
+                        logger.info(
+                            f"Processing image {img_index+1} on page {page_num+1} "
+                            f"({len(image_bytes):,} bytes)"
+                        )
+
+                        description = await llm_service.describe_image(
+                            image_bytes, image_ext
+                        )
+                        image_descriptions.append(description)
+
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to process image {img_index+1} "
+                            f"on page {page_num+1}: {e}"
+                        )
+                        continue
+
+            doc.close()
+
         finally:
-            # Always delete the temp file even if something crashes
             os.unlink(tmp_path)
 
+        full_text = "\n\n".join(text_pages)
+        logger.info(
+            f"PDF parsed | pages={len(text_pages)} | "
+            f"images_described={len(image_descriptions)}"
+        )
+        return full_text, image_descriptions
+
     def _parse_docx(self, file_bytes: bytes) -> str:
-        """Same pattern — temp file needed because python-docx needs a path."""
+        from docx import Document as DocxDocument
         with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
             tmp.write(file_bytes)
             tmp_path = tmp.name
-
         try:
             doc = DocxDocument(tmp_path)
-            paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-            return "\n\n".join(paragraphs)
+            paras = [p.text for p in doc.paragraphs if p.text.strip()]
+            return "\n\n".join(paras)
         finally:
             os.unlink(tmp_path)
 
     # ------------------------------------------------------------------ #
-    # Step 2 — Chunking                                                   #
+    # Chunking                                                             #
     # ------------------------------------------------------------------ #
 
     def _chunk_text(self, text: str) -> list[str]:
-        """
-        Sliding window chunker.
-
-        Example with CHUNK_SIZE=20 chars and CHUNK_OVERLAP=5:
-          text = "The quick brown fox jumps over the lazy dog"
-          chunk 1: "The quick brown fox " (chars 0-20)
-          chunk 2: "fox jumps over the l" (chars 15-35)  ← 5 char overlap
-          chunk 3: "the lazy dog"          (chars 30-end)
-
-        The overlap ensures that if an important sentence falls right at a
-        boundary, at least one of the two adjacent chunks will contain it fully.
-        """
         chunks = []
         start  = 0
-
         while start < len(text):
             end   = start + self.CHUNK_SIZE
             chunk = text[start:end]
-
-            # Try to end the chunk at a sentence boundary (". ")
-            # so we don't cut a sentence in half
             if end < len(text):
                 last_period = chunk.rfind(". ")
                 if last_period > self.CHUNK_SIZE // 2:
-                    # Found a good sentence boundary in the second half — use it
                     end   = start + last_period + 1
                     chunk = text[start:end]
-
             chunk = chunk.strip()
-            # Skip tiny leftover fragments
             if len(chunk) > 50:
                 chunks.append(chunk)
-
-            # Move start forward but overlap by CHUNK_OVERLAP characters
             start = end - self.CHUNK_OVERLAP
-
         return chunks
 
     # ------------------------------------------------------------------ #
-    # Step 3 — Embedding                                                  #
+    # Embedding                                                            #
     # ------------------------------------------------------------------ #
 
     async def _embed_chunks(
         self,
-        chunks: list[str],
+        chunks: list[dict],
         document_id: str,
         filename: str,
         user_id: str,
     ) -> list[dict]:
-        """
-        Embed each chunk one at a time and build the list of Pinecone records.
-
-        Each Pinecone record has three parts:
-          id     — a unique string ID for this vector
-          values — the 3072-float embedding
-          metadata — extra info stored alongside the vector so we can use it
-                     later when we retrieve results (filename, chunk text, etc.)
-        """
         vectors = []
 
         for i, chunk in enumerate(chunks):
-            # Get the embedding from Azure text-embedding-3-large
-            embedding = await llm_service.get_embedding(chunk)
+            embedding = await llm_service.get_embedding(chunk["text"])
 
-            # Build a deterministic ID so re-ingesting the same doc
-            # overwrites the old vectors rather than duplicating them
             vector_id = hashlib.md5(
                 f"{document_id}-chunk-{i}".encode()
             ).hexdigest()
 
             vectors.append({
-                "id": vector_id,
+                "id":     vector_id,
                 "values": embedding,
                 "metadata": {
                     "document_id": document_id,
                     "filename":    filename,
                     "user_id":     user_id,
                     "chunk_index": i,
-                    # Store the chunk text in metadata so we can retrieve it
-                    # without a second database lookup.
-                    # Pinecone metadata values are capped at 40KB — our chunks
-                    # are ~2000 chars so we are well within the limit.
-                    "text": chunk,
+                    "chunk_type":  chunk.get("chunk_type", "text"),
+                    "text":        chunk["text"],
                 },
             })
 
-            # Small log every 10 chunks so you can see progress on large docs
-            if (i + 1) % 10 == 0:
-                logger.info(f"Embedded {i + 1}/{len(chunks)} chunks")
+            if (i + 1) % 5 == 0:
+                logger.info(f"Embedded {i+1}/{len(chunks)} chunks")
 
         return vectors
 
 
-# Single shared instance — import this in your routes
 ingestion_service = IngestionService()

@@ -163,7 +163,8 @@ export default function Sidebar({ selectedDocIds, onSelectDoc, onNewChat }) {
           <input
             ref={fileRef}
             type="file"
-            accept=".pdf,.docx,.txt"
+            
+            accept=".pdf,.docx,.txt,.jpg,.jpeg,.png,.webp"
             onChange={(e) => uploadFile(e.target.files[0])}
             className="hidden"
             id="file-upload"
@@ -196,11 +197,13 @@ export default function Sidebar({ selectedDocIds, onSelectDoc, onNewChat }) {
                         stroke="rgba(255,255,255,0.3)" strokeWidth="1.4"
                         strokeLinecap="round" strokeLinejoin="round"/>
                 </svg>
+                
                 <span className="text-xs text-center" style={{ color: "rgba(255,255,255,0.35)" }}>
                   Upload or drop file
                 </span>
                 <span className="text-xs" style={{ color: "rgba(255,255,255,0.2)" }}>
-                  PDF · DOCX · TXT · max 20 MB
+                  PDF · DOCX · TXT · JPG · PNG · max 20 MB
+                </span>
                 </span>
               </>
             )}
