@@ -51,49 +51,59 @@ class RAGService:
         chat_history: list[dict] | None = None,
         document_ids: list[str] | None = None,
     ) -> AsyncGenerator[str, None]:
-        """
-        Full RAG pipeline. Yields string tokens for SSE streaming.
 
-        Args:
-            question:     The user's question as a plain string.
-            user_id:      Scopes the Pinecone search to this user's namespace.
-            chat_history: Last N turns of conversation for follow-up questions.
-            document_ids: If provided, search only these docs. None = all docs.
-        """
+        # Step 1 — conversational check (greetings, small talk)
+        if self._is_conversational(question):
+            logger.info(f"Conversational query | user={user_id}")
+            async for token in llm_service.chat_stream(
+                self._build_conversational_messages(question, chat_history)
+            ):
+                yield token
+            return
 
-        # Step 1 — embed the question
-        logger.info(f"RAG query | user={user_id} | question='{question[:60]}...'")
+        # Step 2 — summary check (broad document overview requests)
+        if self._is_summary_query(question):
+            logger.info(f"Summary query detected | user={user_id}")
+            async for token in self._handle_summary(
+                question, user_id, document_ids, chat_history
+            ):
+                yield token
+            return
+
+        # Step 3 — normal RAG flow
+        logger.info(f"RAG query | user={user_id} | question='{question[:60]}'")
         query_embedding = await llm_service.get_embedding(question)
 
-        # Step 2 — retrieve candidate chunks from Pinecone
         chunks = self._retrieve(query_embedding, user_id, document_ids)
 
         if not chunks:
-            yield "I couldn't find any relevant information in your uploaded documents for that question."
+            # One more attempt — broaden the search with a rephrased version
+            chunks = await self._broad_retrieve(question, user_id, document_ids)
+
+        if not chunks:
+            yield (
+                "I couldn't find relevant information in your uploaded documents "
+                "for that question.\n\n"
+                "**Try:**\n"
+                "- Rephrasing with more specific terms\n"
+                "- Checking that the right document is uploaded\n"
+                "- Asking about a specific section or topic in the document"
+            )
             return
 
-        # Step 3 — rerank (passthrough for now, reranker drops in here later)
         chunks = self._rerank(question, chunks)
-
-        # Step 4 — trim to top N after reranking
         chunks = chunks[: self.CONTEXT_TOP_N]
 
-        # Step 5 — build the context string and full message list
         context  = self._build_context(chunks)
         messages = self._build_messages(question, context, chat_history)
 
-        # Log which sources we're using
         sources = list({c["filename"] for c in chunks})
         logger.info(f"Answering from {len(chunks)} chunks | sources: {sources}")
 
-        # Step 6 — stream tokens from LLM (Azure → Groq fallback is inside llm_service)
         async for token in llm_service.chat_stream(messages):
             yield token
 
-        # Step 7 — append a sources footer after the full answer
-        sources_line = "\n\n---\n**Sources:** " + ", ".join(sources)
-        yield sources_line
-
+        yield "\n\n---\n**Sources:** " + ", ".join(sources)
     # ------------------------------------------------------------------ #
     # Step 2 — Retrieval                                                  #
     # ------------------------------------------------------------------ #
@@ -141,6 +151,149 @@ class RAGService:
         logger.info(
             f"Pinecone returned {len(result.matches)} matches, "
             f"{len(chunks)} above threshold {self.SCORE_THRESHOLD}"
+        )
+        return chunks
+    
+
+    async def _handle_summary(
+        self,
+        question: str,
+        user_id: str,
+        document_ids: list[str] | None,
+        chat_history: list[dict] | None,
+    ) -> AsyncGenerator[str, None]:
+        """
+        For summary queries, we don't search for a specific answer.
+        Instead we fetch a broad spread of chunks from across the document
+        and ask the LLM to synthesize an overview.
+        """
+        namespace = f"user-{user_id}"
+
+        # Build a generic embedding that retrieves a spread of content
+        # We use a neutral query that will match diverse chunks
+        broad_queries = [
+            "introduction overview main topic",
+            "key points conclusions summary",
+            "important details findings results",
+        ]
+
+        all_chunks = []
+        seen_ids   = set()
+
+        for q in broad_queries:
+            embedding = await llm_service.get_embedding(q)
+
+            query_kwargs = {
+                "vector":           embedding,
+                "top_k":            6,
+                "include_metadata": True,
+                "namespace":        namespace,
+            }
+            if document_ids:
+                query_kwargs["filter"] = {"document_id": {"$in": document_ids}}
+
+            result = self.index.query(**query_kwargs)
+
+            for match in result.matches:
+                if match.score < 0.10 and match.metadata.get("chunk_index") not in seen_ids:
+                    continue
+                chunk_key = match.metadata.get("chunk_index", 0)
+                if chunk_key not in seen_ids:
+                    seen_ids.add(chunk_key)
+                    all_chunks.append({
+                        "text":        match.metadata.get("text", ""),
+                        "filename":    match.metadata.get("filename", "unknown"),
+                        "document_id": match.metadata.get("document_id", ""),
+                        "chunk_index": match.metadata.get("chunk_index", 0),
+                        "score":       match.score,
+                    })
+
+        if not all_chunks:
+            yield (
+                "I wasn't able to retrieve enough content to summarize. "
+                "Please make sure your document has been uploaded and processed successfully."
+            )
+            return
+
+        # Sort by chunk index so the summary follows document order
+        all_chunks.sort(key=lambda x: x["chunk_index"])
+
+        # Take up to 10 chunks for the summary — more than normal RAG
+        summary_chunks = all_chunks[:10]
+
+        context = self._build_context(summary_chunks)
+        sources = list({c["filename"] for c in summary_chunks})
+
+        summary_prompt = (
+            f"The user wants a summary of their document(s).\n\n"
+            f"Here are excerpts from across the document in order:\n\n"
+            f"{context}\n\n"
+            f"---\n\n"
+            f"Please provide a clear, well-structured summary covering:\n"
+            f"- What the document is about\n"
+            f"- The main topics or sections\n"
+            f"- Key points, findings, or conclusions\n\n"
+            f"User's request: {question}"
+        )
+
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": summary_prompt},
+        ]
+
+        logger.info(
+            f"Summary using {len(summary_chunks)} chunks | sources: {sources}"
+        )
+
+        async for token in llm_service.chat_stream(messages):
+            yield token
+
+        yield "\n\n---\n**Sources:** " + ", ".join(sources)
+
+    async def _broad_retrieve(
+        self,
+        question: str,
+        user_id: str,
+        document_ids: list[str] | None,
+    ) -> list[dict]:
+        """
+        Fallback retrieval with a lower threshold and rephrased query.
+        Called when the normal retrieve returns nothing.
+        This catches questions that are slightly off from document vocabulary.
+        """
+        namespace = f"user-{user_id}"
+
+        # Rephrase the question to be more generic
+        rephrased = f"information about {question}"
+        embedding  = await llm_service.get_embedding(rephrased)
+
+        query_kwargs = {
+            "vector":           embedding,
+            "top_k":            self.RETRIEVE_TOP_K,
+            "include_metadata": True,
+            "namespace":        namespace,
+        }
+        if document_ids:
+            query_kwargs["filter"] = {"document_id": {"$in": document_ids}}
+
+        result = self.index.query(**query_kwargs)
+
+        # Use a much lower threshold for this fallback attempt
+        chunks = []
+        for match in result.matches:
+            if match.score < 0.15:
+                continue
+            chunks.append({
+                "text":        match.metadata.get("text", ""),
+                "filename":    match.metadata.get("filename", "unknown"),
+                "document_id": match.metadata.get("document_id", ""),
+                "chunk_index": match.metadata.get("chunk_index", 0),
+                "score":       round(match.score, 4),
+            })
+
+        logger.info(
+            f"Broad retrieval fallback found {len(chunks)} chunks "
+            f"for query='{question[:40]}'"
         )
         return chunks
 
@@ -228,6 +381,84 @@ class RAGService:
         )
         messages.append({"role": "user", "content": user_content})
 
+        return messages
+    
+    def _is_conversational(self, question: str) -> bool:
+        """
+        Lightweight check — no API call, just string matching.
+        Returns True if the question is clearly casual conversation
+        that doesn't need document search.
+        """
+        q = question.lower().strip().rstrip("?!.")
+
+        # Direct greetings and small talk
+        conversational_phrases = {
+            "hi", "hello", "hey", "hiya", "howdy",
+            "how are you", "how are you doing", "how do you do",
+            "what's up", "whats up", "sup",
+            "good morning", "good afternoon", "good evening", "good night",
+            "thanks", "thank you", "thank you so much", "cheers",
+            "bye", "goodbye", "see you", "see ya", "later",
+            "who are you", "what are you", "what can you do",
+            "help", "what is documind", "tell me about yourself",
+        }
+
+        if q in conversational_phrases:
+            return True
+
+        # Short inputs under 4 words that aren't document questions
+        words = q.split()
+        if len(words) <= 3:
+            # These short patterns are almost never document questions
+            greet_starters = ("hi", "hey", "hello", "thanks", "ok", "okay", "cool", "great")
+            if words[0] in greet_starters:
+                return True
+
+        return False
+    
+    def _is_summary_query(self, question: str) -> bool:
+        """
+        Detects when the user wants a summary or overview of the document
+        rather than a specific factual answer.
+        """
+        q = question.lower().strip()
+
+        summary_patterns = [
+            "summarize", "summarise", "summary",
+            "overview", "give me an overview",
+            "what is this document about", "what does this document say",
+            "what is this about", "tell me about this document",
+            "what are the main points", "what are the key points",
+            "main topics", "key topics",
+            "tldr", "tl;dr",
+            "brief me", "brief summary",
+            "explain this document", "explain the document",
+            "what does it say", "what does it cover",
+        ]
+
+        return any(pattern in q for pattern in summary_patterns)
+
+    def _build_conversational_messages(
+        self,
+        question: str,
+        chat_history: list[dict] | None,
+    ) -> list[dict]:
+        """
+        Builds messages for casual conversation — no document context injected.
+        The model answers from its own knowledge.
+        """
+        system = (
+            "You are DocuMind, a friendly and helpful AI document assistant. "
+            "You help users chat with their uploaded documents. "
+            "For casual conversation and greetings, respond naturally and briefly. "
+            "If the user asks a general knowledge question not related to documents, "
+            "you can answer it helpfully from your own knowledge and mention that "
+            "you can also help them search through their uploaded documents."
+        )
+        messages = [{"role": "system", "content": system}]
+        if chat_history:
+            messages.extend(chat_history[-6:])
+        messages.append({"role": "user", "content": question})
         return messages
 
 

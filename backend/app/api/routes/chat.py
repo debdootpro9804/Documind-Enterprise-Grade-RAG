@@ -102,7 +102,17 @@ async def chat_stream(
             # Save to answer cache
             cache_service.set_cached_answer(user_id, body.question, full_answer)
 
-            # Save both turns to Supabase for chat history
+            # If this is a new session, create the session row first.
+            # chat_messages has a foreign key on session_id so the
+            # session must exist before we can insert messages.
+            if not body.session_id:
+                supabase.table("chat_sessions").insert({
+                    "id":      session_id,
+                    "user_id": user_id,
+                    "title":   body.question[:60],
+                }).execute()
+
+            # Now safe to insert messages
             supabase.table("chat_messages").insert([
                 {
                     "session_id": session_id,
