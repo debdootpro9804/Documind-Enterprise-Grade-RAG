@@ -275,7 +275,7 @@ function EmptyState({ onSuggest }) {
         Ask anything about your documents
       </h3>
       <p className="text-sm text-gray-400 max-w-sm leading-relaxed">
-        Upload a PDF, DOCX, or TXT in the sidebar, then ask questions.
+        Upload a PDF, DOCX, TXT or an Image in the sidebar, then ask questions.
         DocuMind finds the relevant sections and answers from them.
       </p>
 
