@@ -224,8 +224,7 @@ Is it conversational? (string match)
 | Relational DB | Supabase PostgreSQL | Documents, sessions, messages |
 | Vector DB | Pinecone | Semantic search (3072 dimensions) |
 | Cache | Upstash Redis | Answer cache + rate limiting |
-| Primary LLM | Azure GPT-4o mini | Inference + chat |
-| Vision LLM | Azure GPT-4o | Image + chart understanding |
+| Primary LLM | Azure GPT-4o | Inference + chat |
 | Fallback LLM | Groq Llama 3.3 70B | Automatic LLM failover |
 | Embeddings | Azure text-embedding-3-large | 3072-dimension vectors |
 | PDF parsing | pymupdf | Text + image extraction |
@@ -296,14 +295,8 @@ documind/
 - Python 3.11+
 - Node.js 20+
 - Accounts on: [Pinecone](https://pinecone.io), [Supabase](https://supabase.com), [Upstash](https://upstash.com), [Groq](https://console.groq.com)
-- Azure OpenAI resource with GPT-4o mini and text-embedding-3-large deployed
+- Azure OpenAI resource with GPT-4o and text-embedding-3-large deployed
 
-### 1. Clone the repository
-
-```bash
-git clone https://github.com/yourusername/documind.git
-cd documind
-```
 
 
 
@@ -324,28 +317,6 @@ Full interactive docs at `https://your-api.onrender.com/api/docs`
 | GET | `/api/chat/sessions/{id}/messages` | Yes | Get session messages |
 | GET | `/api/admin/stats` | Yes | Usage statistics |
 | GET | `/api/health` | No | Health check |
-
-### Chat stream request body
-
-```json
-{
-  "question": "What is the refund policy?",
-  "session_id": "uuid-optional-for-history",
-  "document_ids": ["uuid1", "uuid2"]
-}
-```
-
-`document_ids` is optional — omit it to search across all user documents.
-
-### SSE response format
-
-```
-data: {"token": "The"}
-data: {"token": " refund"}
-data: {"token": " policy"}
-...
-data: [DONE]
-```
 
 ---
 
@@ -378,8 +349,3 @@ Every `git push` to `main` triggers automatic redeploy on both platforms.
 
 Built by  Debdoot Sen
 
-
-
----
-
-*Built with FastAPI, React, Pinecone, Supabase, Azure OpenAI, and a lot of debugging.*
