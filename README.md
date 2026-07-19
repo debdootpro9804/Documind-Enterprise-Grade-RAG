@@ -20,7 +20,7 @@
 
 ## What is DocuMind
 
-DocuMind is a production-grade multi-user platform that lets people upload documents and chat with them using AI. Unlike simple RAG tutorials, this is built with the full stack a real product needs — authentication, vector search, streaming responses, caching, rate limiting, LLM failover, and image understanding.
+DocuMind is a multi-user platform that lets people upload documents and chat with them using AI. Unlike simple RAG tutorials, this is built with the full stack a real product needs — authentication, vector search, streaming responses, caching, rate limiting, LLM failover, and image understanding.
 
 **The problem it solves:** Reading through large documents to find specific information is slow and inefficient. DocuMind lets you ask plain English questions and get precise, cited answers in seconds.
 
